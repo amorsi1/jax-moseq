@@ -202,54 +202,31 @@ def resample_ar_params(
         Autoregressive noise covariances.
     """
     seeds = jr.split(seed, num_states)
-
-    masks = mask[..., nlags:].reshape(1, -1) * jnp.eye(num_states)[:, z.reshape(-1)]
+    mask_flat = mask[..., nlags:].reshape(-1)
+    z_flat = z.reshape(-1)
     x_in = pad_affine(get_lags(x, nlags)).reshape(-1, nlags * x.shape[-1] + 1)
     x_out = x[..., nlags:, :].reshape(-1, x.shape[-1])
 
-    map_fun = partial(_resample_regression_params, x_in, x_out, nu_0, S_0, M_0, K_0)
-    Ab, Q = jax.lax.map(map_fun, (seeds, masks))
-    return Ab, Q
+    def resample_state(args):
+        # the per-state mask is built lazily: no (num_states, N * T) array
+        seed_k, k = args
+        mask_k = mask_flat * (z_flat == k).astype(mask_flat.dtype)
+        x_in_m = x_in * mask_k[:, na]
+        x_out_m = x_out * mask_k[:, na]
+        stats = (x_out_m.T @ x_out, x_out_m.T @ x_in, x_in_m.T @ x_in)
+        return _sample_regression_params(
+            seed_k, *stats, mask_k.sum(), nu_0, S_0, M_0, K_0
+        )
+
+    return jax.lax.map(resample_state, (seeds, jnp.arange(num_states)))
 
 
 @nan_check
-@jax.jit
-def _resample_regression_params(x_in, x_out, nu_0, S_0, M_0, K_0, args):
-    """
-    Resamples regression parameters from a Matrix normal
-    inverse-Wishart distribution.
-
-    Parameters
-    ----------
-    x_in : jax array of shape (..., in_dim)
-        Regression input.
-    x_out : jax array of shape (..., out_dim)
-        Regression output.
-    nu_0 : int
-        Inverse-Wishart degrees of freedom parameter for Q.
-    S_0 : jax array of shape (out_dim, out_dim)
-        Inverse-Wishart scale parameter for Q.
-    M_0 : jax array of shape (out_dim, in_dim)
-        Matrix normal expectation for Ab.
-    K_0 : jax array of shape (in_dim, in_dim)
-        Matrix normal column scale parameter for Ab.
-    args: tuple (seed, mask)
-        JAX random seed and binary indicator for frames
-        to use for calculating the sufficient statistics.
-
-    Returns
-    ------
-    Ab : jax array of shape (num_states, out_dim, in_dim)
-        Regression transforms.
-    Q : jax array of shape (num_states, out_dim, out_dim)
-        Regression noise covariances.
-    """
-    seed, mask = args
-
-    S_out_out = jnp.einsum("ti,tj,t->ij", x_out, x_out, mask)
-    S_out_in = jnp.einsum("ti,tj,t->ij", x_out, x_in, mask)
-    S_in_in = jnp.einsum("ti,tj,t->ij", x_in, x_in, mask)
-
+def _sample_regression_params(
+    seed, S_out_out, S_out_in, S_in_in, count, nu_0, S_0, M_0, K_0
+):
+    """Samples (Ab, Q) from the Matrix normal inverse-Wishart posterior given
+    the masked sufficient statistics and the number of frames used."""
     K_0_inv = psd_inv(K_0)
     K_n_inv = K_0_inv + S_in_in
 
@@ -257,7 +234,7 @@ def _resample_regression_params(x_in, x_out, nu_0, S_0, M_0, K_0, args):
     M_n = psd_solve(K_n_inv.T, K_0_inv @ M_0.T + S_out_in.T).T
 
     S_n = S_0 + S_out_out + (M_0 @ K_0_inv @ M_0.T - M_n @ K_n_inv @ M_n.T)
-    return sample_mniw(seed, nu_0 + mask.sum(), S_n, M_n, K_n)
+    return sample_mniw(seed, nu_0 + count, S_n, M_n, K_n)
 
 
 def resample_model(
