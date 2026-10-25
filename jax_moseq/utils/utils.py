@@ -6,6 +6,7 @@ from jax.scipy.linalg import cho_factor, cho_solve
 from textwrap import fill
 import functools
 from math import ceil
+from typing import Optional
 
 _MIXED_MAP_ITERS = 1
 _MIXED_MAP_GPUS = 1
@@ -403,121 +404,142 @@ def set_mixed_map_gpus(gpus):
     _MIXED_MAP_GPUS = gpus
 
 
-def _reshape_args(args, axes):
-    """Reshape args to (pmap dim, lax.map dim, vmap dim, [other dims])"""
-    n_iters = get_mixed_map_iters()
-    n_gpus = get_mixed_map_gpus()
-    axis_size = args[0].shape[axes[0]]
-
-    vmap_size = ceil(axis_size / n_iters / n_gpus)
-    pmap_size = ceil(axis_size / vmap_size / n_iters)
-    lmap_size = ceil(axis_size / vmap_size / pmap_size)
-    padding = vmap_size * pmap_size * lmap_size - axis_size
-
-    def _reshape(a, axis):
-        if axis > 0:
-            a = jnp.moveaxis(a, axis, 0)
-        if padding > 0:
-            padding_array = jnp.zeros((padding, *a.shape[1:]), dtype=a.dtype)
-            a = jnp.concatenate((a, padding_array))
-        return a.reshape(lmap_size, pmap_size, vmap_size, *a.shape[1:])
-
-    args = [_reshape(arg, axis) for arg, axis in zip(args, axes)]
-    return args, axis_size
+def _as_axes(axes, n: int, name: str) -> tuple:
+    """Broadcast an int/None `axes` spec to a tuple of length `n`."""
+    if axes is None or isinstance(axes, int):
+        return (0 if axes is None else axes,) * n
+    assert len(axes) == n, f"`{name}` should be a tuple with length {n}, got {len(axes)}"
+    return tuple(axes)
 
 
-def _reshape_outputs(outputs, axes, axis_size):
-    """Reshape outputs from (lax.map dim, vmap dim, [other dims])"""
-
-    def _reshape(a, axis):
-        a = a.reshape(-1, *a.shape[3:])[:axis_size]
-        if axis > 0:
-            a = jnp.moveaxis(a, 0, axis)
-        return a
-
-    outputs = [_reshape(out, axis) for out, axis in zip(outputs, axes)]
-    if len(outputs) == 1:
-        outputs = outputs[0]
-    return outputs
-
-
-def _partial(fun, other_args, mapped_argnums, other_argnums):
-    def partial_fun(mapped_args):
-        args = {}
-        for i, arg in zip(mapped_argnums, mapped_args):
-            args[i] = arg
-        for i, arg in zip(other_argnums, other_args):
-            args[i] = arg
-        args = [args[i] for i in range(len(args))]
-        return fun(*args)
-
-    return partial_fun
-
-
-def _sort_args(args, in_axes):
-    """Sort arguments into mapped and unmapped arguments."""
-    mapped_args, mapped_argnums = [], []
-    other_args, other_argnums = [], []
-    for i, (arg, axis) in enumerate(zip(args, in_axes)):
-        if axis is not None:
-            mapped_args.append(arg)
-            mapped_argnums.append(i)
-        else:
-            other_args.append(arg)
-            other_argnums.append(i)
-    return mapped_args, mapped_argnums, other_args, other_argnums
-
-
-def mixed_map(fun, in_axes=None, out_axes=None):
+def mixed_map(
+    fun,
+    in_axes=None,
+    out_axes=None,
+    iters: Optional[int] = None,
+    gpus: Optional[int] = None,
+):
     """
-    Combine jax.pmap, jax.vmap and jax.lax.map for parallelization.
+    Memory-efficient drop-in replacement for `jax.vmap(fun, in_axes, out_axes)`.
 
-    This function is similar to `jax.vmap`, except that it mixes together
-    `jax.pmap`, `jax.vmap` and `jax.lax.map` to prevent OOM errors and allow
-    for parallelization across multiple GPUs. The behavior is determined by
-    the global variables `_MIXED_MAP_ITERS` and `_MIXED_MAP_GPUS`, which can be
-    set using :py:func:`jax_moseq.utils.set_mixed_map_iters` and
-    py:func:`jax_moseq.utils.set_mixed_map_gpus` respectively.
+    The mapped axis (of size N) is processed in serial chunks with
+    `jax.lax.fori_loop`; each chunk is evaluated with `jax.vmap` (and
+    `jax.pmap` across `gpus` devices if `gpus > 1`). Rows must be independent,
+    i.e. `fun` must not mix information across the mapped axis.
 
-    Given an axis size of N to map, the data is padded such that the axis size
-    is a multiple of the number of `_MIXED_MAP_ITERS * _MIXED_MAP_GPUS`. The
-    data is then processed serially chunks, where the number of chunks is
-    determined by `_MIXED_MAP_ITERS`. Each chunk is processed in parallel
-    using jax.pmap to distribute across `_MIXED_MAP_GPUS` devices and jax.vmap
-    within each device.
+    Parameters
+    ----------
+    iters: int, optional
+        Target number of serial steps (>= 1). Each step processes
+        `ceil(N / iters)` rows (rounded up to a multiple of `gpus`). Defaults
+        to :py:func:`jax_moseq.utils.get_mixed_map_iters`, read at call time.
+    gpus: int, optional
+        Number of devices for `jax.pmap` within each step. Defaults to
+        :py:func:`jax_moseq.utils.get_mixed_map_gpus`, read at call time.
+        If rounding a chunk up to a multiple of `gpus` would exceed N, a
+        single N-row step is used when `gpus` divides N, otherwise `gpus=1`.
+
+    Inputs are sliced inside the loop and outputs are written into buffers
+    allocated once, so no padded or reshaped copies of the full arrays are
+    made. When N is not a multiple of the step size, the last step overlaps
+    the previous one (recomputing identical rows) instead of padding.
     """
 
     @functools.wraps(fun)
     def mixed_map_f(*args):
-        nonlocal in_axes
-        nonlocal out_axes
+        n_iters = get_mixed_map_iters() if iters is None else iters
+        n_gpus = get_mixed_map_gpus() if gpus is None else gpus
+        if n_iters < 1 or n_gpus < 1:
+            raise ValueError(f"`iters` and `gpus` must be >= 1, got {n_iters}, {n_gpus}")
 
-        if in_axes is None:
-            in_axes = tuple([0] * len(args))
-        else:
-            assert len(in_axes) == len(
-                args
-            ), "`in_axes` should be a tuple with the same length as the number of arguments"
+        axes = _as_axes(in_axes, len(args), "in_axes")
+        mapped = [i for i, ax in enumerate(axes) if ax is not None]
+        if not mapped:
+            raise ValueError("at least one argument must be mapped")
+        N = args[mapped[0]].shape[axes[mapped[0]]]
 
-        mapped_args, mapped_argnums, other_args, other_argnums = _sort_args(
-            args, in_axes
+        # step = rows per serial iteration = vmap_size * n_gpus <= N
+        vmap_size = ceil(ceil(N / n_iters) / n_gpus)
+        if vmap_size * n_gpus > N:
+            n_gpus = n_gpus if N % n_gpus == 0 else 1
+            vmap_size = N // n_gpus
+        step = vmap_size * n_gpus
+        n_steps = ceil(N / step)
+        mapped_axes = tuple(axes[i] for i in mapped)
+
+        def call(*mapped_args):
+            full = list(args)
+            for i, a in zip(mapped, mapped_args):
+                full[i] = a
+            return fun(*full)
+
+        def run_chunk(start):
+            chunk = [
+                jax.lax.dynamic_slice_in_dim(args[i], start, step, axis=ax)
+                for i, ax in zip(mapped, mapped_axes)
+            ]
+            if n_gpus > 1:
+                chunk = [
+                    a.reshape(*a.shape[:ax], n_gpus, vmap_size, *a.shape[ax + 1 :])
+                    for a, ax in zip(chunk, mapped_axes)
+                ]
+            outs = chunk_fn(*chunk)
+            if n_gpus > 1:  # merge (n_gpus, vmap_size) at each out axis
+                outs = jax.tree.map(
+                    lambda o, ax: o.reshape(*o.shape[:ax], step, *o.shape[ax + 2 :]),
+                    outs,
+                    out_axes_tree,
+                )
+            return outs
+
+        # output structure/axes are only known after tracing `fun`
+        out_struct = jax.eval_shape(
+            jax.vmap(call, in_axes=mapped_axes),
+            *[
+                jax.ShapeDtypeStruct(
+                    args[i].shape[:ax] + (1,) + args[i].shape[ax + 1 :], args[i].dtype
+                )
+                for i, ax in zip(mapped, mapped_axes)
+            ],
         )
-        mapped_args, axis_size = _reshape_args(
-            mapped_args, [in_axes[i] for i in mapped_argnums]
-        )
-        f = _partial(fun, other_args, mapped_argnums, other_argnums)
-        outputs = jax.lax.map(jax.pmap(jax.vmap(f)), mapped_args)
-
-        if not isinstance(outputs, tuple) or isinstance(outputs, list):
-            outputs = (outputs,)
-        if out_axes is None:
-            out_axes = tuple([0] * len(outputs))
+        n_out = len(out_struct) if isinstance(out_struct, (tuple, list)) else 1
+        out_axes_tree = _as_axes(out_axes, n_out, "out_axes")
+        if not isinstance(out_struct, (tuple, list)):
+            out_axes_tree = out_axes_tree[0]
         else:
-            assert len(out_axes) == len(
-                outputs
-            ), "`out_axes` should be a tuple with the same length as the number of function outputs"
+            out_axes_tree = type(out_struct)(out_axes_tree)
 
-        outputs = _reshape_outputs(outputs, out_axes, axis_size)
-        return outputs
+        vmapped = jax.vmap(call, in_axes=mapped_axes, out_axes=out_axes_tree)
+        if n_gpus > 1:
+            chunk_fn = jax.pmap(
+                vmapped,
+                in_axes=mapped_axes,
+                out_axes=out_axes_tree,
+            )
+        else:
+            chunk_fn = vmapped
+
+        if n_steps == 1:  # step == N: no loop or buffers needed
+            return run_chunk(0)
+
+        def alloc(spec, ax):
+            # `spec` was traced with a size-1 mapped axis at position 0
+            shape = list(spec.shape[1:])
+            shape.insert(ax % (len(shape) + 1), N)
+            return jnp.zeros(shape, spec.dtype)
+
+        bufs = jax.tree.map(alloc, out_struct, out_axes_tree)
+
+        def body(i, bufs):
+            start = jnp.minimum(i * step, N - step)
+            outs = run_chunk(start)
+            return jax.tree.map(
+                lambda b, o, ax: jax.lax.dynamic_update_slice_in_dim(b, o, start, axis=ax),
+                bufs,
+                outs,
+                out_axes_tree,
+            )
+
+        return jax.lax.fori_loop(0, n_steps, body, bufs)
 
     return mixed_map_f
