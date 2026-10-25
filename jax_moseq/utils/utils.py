@@ -485,7 +485,7 @@ def mixed_map(
                 ]
             outs = chunk_fn(*chunk)
             if n_gpus > 1:  # merge (n_gpus, vmap_size) at each out axis
-                outs = jax.tree.map(
+                outs = jax.tree_util.tree_map(
                     lambda o, ax: o.reshape(*o.shape[:ax], step, *o.shape[ax + 2 :]),
                     outs,
                     out_axes_tree,
@@ -528,12 +528,12 @@ def mixed_map(
             shape.insert(ax % (len(shape) + 1), N)
             return jnp.zeros(shape, spec.dtype)
 
-        bufs = jax.tree.map(alloc, out_struct, out_axes_tree)
+        bufs = jax.tree_util.tree_map(alloc, out_struct, out_axes_tree)
 
         def body(i, bufs):
             start = jnp.minimum(i * step, N - step)
             outs = run_chunk(start)
-            return jax.tree.map(
+            return jax.tree_util.tree_map(
                 lambda b, o, ax: jax.lax.dynamic_update_slice_in_dim(b, o, start, axis=ax),
                 bufs,
                 outs,
