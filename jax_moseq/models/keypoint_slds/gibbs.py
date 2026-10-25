@@ -575,7 +575,12 @@ def resample_model(
     if verbose:
         print("Resampling v (location)")
     states["v"] = resample_location(
-        seed, **data, **states, **params, **hypparams["cen_hypparams"]
+        seed,
+        **data,
+        **states,
+        **params,
+        **hypparams["cen_hypparams"],
+        parallel_message_passing=parallel_message_passing,
     )
 
     if resample_local_noise_scale:
