@@ -543,3 +543,33 @@ def mixed_map(
         return jax.lax.fori_loop(0, n_steps, body, bufs)
 
     return mixed_map_f
+
+
+def mixed_map_jit(fun=None, *, static_argnames=()):
+    """`jax.jit` that follows the global `mixed_map` settings.
+
+    A jitted function that calls `mixed_map` reads `get_mixed_map_iters()` once
+    at trace time, so later calls to `set_mixed_map_iters` would be silently
+    ignored. This decorator passes the current iters/gpus to `fun` as the
+    static keyword arguments `mixed_map_iters` and `mixed_map_gpus` (forward
+    them to `mixed_map(..., iters=..., gpus=...)`), so changing the globals
+    re-traces instead.
+    """
+
+    def decorator(fun):
+        jitted = jax.jit(
+            fun, static_argnames=(*static_argnames, "mixed_map_iters", "mixed_map_gpus")
+        )
+
+        @functools.wraps(fun)
+        def wrapper(*args, **kwargs):
+            return jitted(
+                *args,
+                mixed_map_iters=get_mixed_map_iters(),
+                mixed_map_gpus=get_mixed_map_gpus(),
+                **kwargs,
+            )
+
+        return wrapper
+
+    return decorator if fun is None else decorator(fun)
