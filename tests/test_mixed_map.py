@@ -20,8 +20,11 @@ import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 
 from jax_moseq.utils import (  # noqa: E402
+    get_mixed_map_gpus,
     get_mixed_map_iters,
     mixed_map,
+    mixed_map_jit,
+    set_mixed_map_gpus,
     set_mixed_map_iters,
 )
 
@@ -265,3 +268,43 @@ def test_in_axes_length_mismatch_raises():
     a = jnp.arange(4.0)
     with pytest.raises((AssertionError, ValueError)):
         f(a, a)
+
+
+@pytest.fixture
+def restore_mixed_map_globals():
+    iters, gpus = get_mixed_map_iters(), get_mixed_map_gpus()
+    yield
+    set_mixed_map_iters(iters)
+    set_mixed_map_gpus(gpus)
+
+
+def test_mixed_map_jit_follows_globals(restore_mixed_map_globals):
+    n = 13
+    x = jnp.arange(n * 3, dtype=float).reshape(n, 3)
+    traces = []
+
+    @mixed_map_jit
+    def run(x, mixed_map_iters, mixed_map_gpus):
+        traces.append((mixed_map_iters, mixed_map_gpus))
+        return mixed_map(lambda r: r * 2.0, iters=mixed_map_iters, gpus=mixed_map_gpus)(x)
+
+    for k in [1, 4, 4, 1]:
+        set_mixed_map_iters(k)
+        np.testing.assert_array_equal(run(x), x * 2.0)
+    # one trace per distinct setting, none for repeats
+    assert traces == [(1, 1), (4, 1)]
+
+    set_mixed_map_iters(4)
+    trips = _trip_counts(jax.make_jaxpr(run)(x))
+    assert 4 in trips
+
+
+def test_mixed_map_jit_with_static_argnames(restore_mixed_map_globals):
+    x = jnp.ones((6, 2))
+
+    @mixed_map_jit(static_argnames=("scale",))
+    def run(x, scale, mixed_map_iters, mixed_map_gpus):
+        return mixed_map(lambda r: r * scale, iters=mixed_map_iters, gpus=mixed_map_gpus)(x)
+
+    set_mixed_map_iters(3)
+    np.testing.assert_array_equal(run(x, scale=3.0), x * 3.0)
