@@ -7,6 +7,51 @@ from jax_moseq.utils import convert_data_precision
 
 na = jnp.newaxis
 
+# (rel_floor, abs_floor) of the PSD projection applied before Cholesky
+# factorizations, or None (default) to factor the matrices as given.
+_STABLE_CHOLESKY = None
+
+
+def get_stable_cholesky():
+    """Get ``(rel_floor, abs_floor)`` if the PSD projection before Cholesky
+    factorizations is enabled, otherwise ``None``."""
+    return _STABLE_CHOLESKY
+
+
+def set_stable_cholesky(
+    enabled: bool, rel_floor: float = 0.2, abs_floor: float = 1e-3
+) -> None:
+    """Enable or disable a float32-stabilizing PSD projection in
+    :py:func:`sample_invwishart` and :py:func:`sample_mn`.
+
+    In float32 the matrices that get factorized can have slightly negative
+    eigenvalues (e.g. from cancellation), which makes ``cholesky`` return NaN.
+    When enabled, they are symmetrized and their eigenvalues are clipped below
+    at ``max(abs_floor, rel_floor * largest eigenvalue)`` first. Off by default.
+
+    The setting is read when functions are traced, so changing it clears the
+    jit caches to make already-compiled callers pick it up.
+    """
+    global _STABLE_CHOLESKY
+    new = (rel_floor, abs_floor) if enabled else None
+    if new != _STABLE_CHOLESKY:
+        _STABLE_CHOLESKY = new
+        jax.clear_caches()
+
+
+def _psd_clip(S, rel_floor, abs_floor):
+    S = (S + jnp.swapaxes(S, -1, -2)) / 2
+    w, v = jnp.linalg.eigh(S)
+    floor = jnp.maximum(abs_floor, rel_floor * jnp.max(w, axis=-1, keepdims=True))
+    w = jnp.clip(w, floor, None)
+    return (v * w[..., None, :]) @ jnp.swapaxes(v, -1, -2)
+
+
+def _cholesky(S):
+    if _STABLE_CHOLESKY is not None:
+        S = _psd_clip(S, *_STABLE_CHOLESKY)
+    return jnp.linalg.cholesky(S)
+
 
 def sample_vonmises(seed, theta, kappa):
     return tfd.VonMises(theta, kappa).sample(seed=seed)
@@ -36,8 +81,8 @@ def sample_chi2(seed, degs):
 
 def sample_mn(seed, M, U, V):
     G = jr.normal(seed, M.shape)
-    G = jnp.dot(jnp.linalg.cholesky(U), G)
-    G = jnp.dot(G, jnp.linalg.cholesky(V).T)
+    G = jnp.dot(_cholesky(U), G)
+    G = jnp.dot(G, _cholesky(V).T)
     return M + G
 
 
@@ -49,7 +94,7 @@ def sample_invwishart(seed, S, nu):
     x = x.at[jnp.triu_indices_from(x, 1)].set(jr.normal(norm_seed, (n * (n - 1) // 2,)))
     R = jnp.linalg.qr(x, "r")
 
-    chol = jnp.linalg.cholesky(S)
+    chol = _cholesky(S)
 
     T = jax.scipy.linalg.solve_triangular(R.T, chol.T, lower=True).T
     return jnp.dot(T, T.T)
