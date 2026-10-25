@@ -3,10 +3,16 @@ import jax.numpy as jnp
 import jax.random as jr
 from functools import partial
 
+from jax_moseq.utils import mixed_map_jit
 from jax_moseq.utils.kalman import kalman_sample
 from jax_moseq.utils.distributions import sample_vonmises_fisher
 
 from jax_moseq.models import arhmm, slds
+from jax_moseq.models.slds.gibbs import (
+    _map_sessions,
+    _resample_x,
+    _resample_obs_variance_from_stats,
+)
 from jax_moseq.models.keypoint_slds.alignment import (
     to_vanilla_slds,
     estimate_coordinates,
@@ -18,6 +24,7 @@ from jax_moseq.models.keypoint_slds.alignment import (
 na = jnp.newaxis
 
 
+@mixed_map_jit(static_argnames=("parallel_message_passing",))
 def resample_continuous_stateseqs(
     seed,
     Y,
@@ -32,6 +39,8 @@ def resample_continuous_stateseqs(
     Q,
     jitter=1e-3,
     parallel_message_passing=True,
+    mixed_map_iters=None,
+    mixed_map_gpus=None,
     **kwargs
 ):
     """
@@ -75,25 +84,44 @@ def resample_continuous_stateseqs(
     x : jax array of shape (N, T, latent_dim)
         Latent trajectories.
     """
-    Y, s, Cd, sigmasq = to_vanilla_slds(Y, v, h, s, Cd, sigmasq)
-    x = slds.resample_continuous_stateseqs(
+    return _resample_x(
         seed,
-        Y,
         mask,
         z,
-        s,
         Ab,
         Q,
         Cd,
         sigmasq,
-        jitter=jitter,
-        parallel_message_passing=parallel_message_passing,
+        (Y, s, v, h),
+        lambda Cd, sigmasq, Y, s, v, h: to_vanilla_slds(Y, v, h, s, Cd, sigmasq),
+        jitter,
+        parallel_message_passing,
+        mixed_map_iters,
+        mixed_map_gpus,
     )
-    return x
 
 
-@jax.jit
-def resample_obs_variance(seed, Y, mask, Cd, x, v, h, s, nu_sigma, sigmasq_0, **kwargs):
+def _weighted_sqerr_one_session(Y, x, v, h, mask, s, Cd):
+    """Per-session sum over time of ``sqerr / s``, shape (k,)."""
+    return (compute_squared_error(Y, x, v, h, Cd, mask) / s).sum(0)
+
+
+@mixed_map_jit
+def resample_obs_variance(
+    seed,
+    Y,
+    mask,
+    Cd,
+    x,
+    v,
+    h,
+    s,
+    nu_sigma,
+    sigmasq_0,
+    mixed_map_iters=None,
+    mixed_map_gpus=None,
+    **kwargs
+):
     """
     Resample the observation variance ``sigmasq``.
 
@@ -127,14 +155,41 @@ def resample_obs_variance(seed, Y, mask, Cd, x, v, h, s, nu_sigma, sigmasq_0, **
     sigmasq : jax_array of shape k
         Unscaled noise.
     """
-    sqerr = compute_squared_error(Y, x, v, h, Cd, mask)
-    return slds.resample_obs_variance_from_sqerr(
-        seed, sqerr, mask, s, nu_sigma, sigmasq_0
-    )
+    S_y = _map_sessions(
+        _weighted_sqerr_one_session,
+        Y,
+        x,
+        v,
+        h,
+        mask,
+        s,
+        mixed_map_iters=mixed_map_iters,
+        mixed_map_gpus=mixed_map_gpus,
+        Cd=Cd,
+    ).sum(0)
+    return _resample_obs_variance_from_stats(seed, mask, S_y, nu_sigma, sigmasq_0)
 
 
-@jax.jit
-def resample_scales(seed, Y, x, v, h, Cd, sigmasq, nu_s, s_0, **kwargs):
+def _resample_scales_one_session(seed, Y, x, v, h, s_0, *, Cd, sigmasq, nu_s):
+    sqerr = compute_squared_error(Y, x, v, h, Cd)
+    return slds.resample_scales_from_sqerr(seed, sqerr, sigmasq, nu_s, s_0)
+
+
+@mixed_map_jit
+def resample_scales(
+    seed,
+    Y,
+    x,
+    v,
+    h,
+    Cd,
+    sigmasq,
+    nu_s,
+    s_0,
+    mixed_map_iters=None,
+    mixed_map_gpus=None,
+    **kwargs
+):
     """
     Resample the scale values ``s``.
 
@@ -166,8 +221,28 @@ def resample_scales(seed, Y, x, v, h, Cd, sigmasq, nu_s, s_0, **kwargs):
     s : jax array of shape (N, T, k)
         Noise scales.
     """
-    sqerr = compute_squared_error(Y, x, v, h, Cd)
-    return slds.resample_scales_from_sqerr(seed, sqerr, sigmasq, nu_s, s_0)
+    N = Y.shape[0]
+    # Per-session seeds, so (unlike a single full-array gamma draw) the stream
+    # differs from earlier versions: statistically equivalent and chunk-size
+    # invariant.
+    session_args = [jr.split(seed, N), Y, x, v, h]
+    # ``s_0`` is mapped over sessions if it has the shape of ``s`` (N, T, k);
+    # anything else (scalar, (k,), (T, k), ...) is shared by all sessions.
+    shared = {}
+    if jnp.ndim(s_0) == Y.ndim - 1 and jnp.shape(s_0)[0] == N:
+        session_args.append(s_0)
+    else:
+        shared["s_0"] = s_0
+    return _map_sessions(
+        _resample_scales_one_session,
+        *session_args,
+        mixed_map_iters=mixed_map_iters,
+        mixed_map_gpus=mixed_map_gpus,
+        Cd=Cd,
+        sigmasq=sigmasq,
+        nu_s=nu_s,
+        **shared,
+    )
 
 
 @jax.jit
@@ -204,8 +279,34 @@ def compute_squared_error(Y, x, v, h, Cd, mask=None):
     return sqerr
 
 
-@jax.jit
-def resample_heading(seed, Y, x, v, s, Cd, sigmasq, **kwargs):
+def _heading_mean_direction_one_session(Y, x, v, s, *, Cd, sigmasq):
+    k = Y.shape[-2]
+
+    Y_bar = estimate_aligned(x, Cd, k)
+    Y_cent = Y - v[..., na, :]
+    variance = s * sigmasq
+
+    # [(t, k, d, na) * (t, k, na, d) / (t, k, na, na)] -> (t, d, d)
+    S = (Y_bar[..., :2, na] * Y_cent[..., na, :2] / variance[..., na, na]).sum(-3)
+
+    kappa_cos = S[..., 0, 0] + S[..., 1, 1]
+    kappa_sin = S[..., 0, 1] - S[..., 1, 0]
+    return jnp.stack([kappa_cos, kappa_sin], axis=-1)
+
+
+@mixed_map_jit
+def resample_heading(
+    seed,
+    Y,
+    x,
+    v,
+    s,
+    Cd,
+    sigmasq,
+    mixed_map_iters=None,
+    mixed_map_gpus=None,
+    **kwargs
+):
     """
     Resample the heading angles ``h``.
 
@@ -233,27 +334,79 @@ def resample_heading(seed, Y, x, v, s, Cd, sigmasq, **kwargs):
     h : jax array of shape (N, T)
         Heading angles.
     """
-    k = Y.shape[-2]
-
-    Y_bar = estimate_aligned(x, Cd, k)
-    Y_cent = Y - v[..., na, :]
-    variance = s * sigmasq
-
-    # [(..., t, k, d, na) * (..., t, k, na, d) / (..., t, k, na, na)] -> (..., t, d, d)
-    S = (Y_bar[..., :2, na] * Y_cent[..., na, :2] / variance[..., na, na]).sum(-3)
-    del Y_bar, Y_cent, variance  # free up memory
-
-    kappa_cos = S[..., 0, 0] + S[..., 1, 1]
-    kappa_sin = S[..., 0, 1] - S[..., 1, 0]
-    del S
-
-    mean_direction = jnp.stack([kappa_cos, kappa_sin], axis=-1)
+    mean_direction = _map_sessions(
+        _heading_mean_direction_one_session,
+        Y,
+        x,
+        v,
+        s,
+        mixed_map_iters=mixed_map_iters,
+        mixed_map_gpus=mixed_map_gpus,
+        Cd=Cd,
+        sigmasq=sigmasq,
+    )
+    # A single draw over the assembled (N, T, 2) array keeps ``h`` identical
+    # to the unchunked computation.
     sampled_direction = sample_vonmises_fisher(seed, mean_direction)
     h = vector_to_angle(sampled_direction)
     return h
 
 
-@jax.jit
+def _resample_location_one_session(
+    seed, Y, mask, x, h, s, *, Cd, sigmasq, sigmasq_loc, parallel
+):
+    k, d = Y.shape[-2:]
+
+    Y_rot = apply_rotation(estimate_aligned(x, Cd, k), h)
+
+    variance = s * sigmasq
+    gammasq = 1 / (1 / variance).sum(-1, keepdims=True)
+
+    mu = jnp.einsum("...tkd, ...tk->...td", Y - Y_rot, gammasq / variance)
+
+    # Apply Kalman filter to get smooth headings
+    # TODO Parameterize these distributional hyperparameter
+    m0 = jnp.zeros(d)
+    S0 = jnp.eye(d) * 1e4
+    A = jnp.eye(d)[na]
+    B = jnp.zeros(d)[na]
+    Q = jnp.eye(d)[na] * sigmasq_loc
+    C = jnp.eye(d)
+    D = jnp.zeros(d)
+    R = jnp.repeat(gammasq, d, axis=-1)
+    zz = jnp.zeros_like(mask[1:], dtype=int)
+
+    masked_dynamics_noise = sigmasq_loc * 10
+    masked_obs_noise = sigmasq.max() * 10
+
+    masked_dynamics_params = {
+        "weights": jnp.eye(d),
+        "bias": jnp.zeros(d),
+        "cov": jnp.eye(d) * masked_dynamics_noise,
+    }
+
+    masked_obs_noise_diag = jnp.ones(d) * masked_obs_noise
+
+    return kalman_sample(
+        seed,
+        mu,
+        mask,
+        zz,
+        m0,
+        S0,
+        A,
+        B,
+        Q,
+        C,
+        D,
+        R,
+        masked_dynamics_params,
+        masked_obs_noise_diag,
+        parallel=parallel,
+    )
+
+
+@mixed_map_jit(static_argnames=("parallel_message_passing",))
 def resample_location(
     seed,
     Y,
@@ -265,6 +418,8 @@ def resample_location(
     sigmasq,
     sigmasq_loc,
     parallel_message_passing=True,
+    mixed_map_iters=None,
+    mixed_map_gpus=None,
     **kwargs
 ):
     """
@@ -301,57 +456,21 @@ def resample_location(
     v : jax array of shape (N, T, d)
         Centroid positions.
     """
-    k, d = Y.shape[-2:]
-
-    Y_rot = apply_rotation(estimate_aligned(x, Cd, k), h)
-
-    variance = s * sigmasq
-    gammasq = 1 / (1 / variance).sum(-1, keepdims=True)
-
-    mu = jnp.einsum("...tkd, ...tk->...td", Y - Y_rot, gammasq / variance)
-
-    # Apply Kalman filter to get smooth headings
-    # TODO Parameterize these distributional hyperparameter
-    seed = jr.split(seed, mask.shape[0])
-    m0 = jnp.zeros(d)
-    S0 = jnp.eye(d) * 1e4
-    A = jnp.eye(d)[na]
-    B = jnp.zeros(d)[na]
-    Q = jnp.eye(d)[na] * sigmasq_loc
-    C = jnp.eye(d)
-    D = jnp.zeros(d)
-    R = jnp.repeat(gammasq, d, axis=-1)
-    zz = jnp.zeros_like(mask[:, 1:], dtype=int)
-
-    masked_dynamics_noise = sigmasq_loc * 10
-    masked_obs_noise = sigmasq.max() * 10
-
-    masked_dynamics_params = {
-        "weights": jnp.eye(d),
-        "bias": jnp.zeros(d),
-        "cov": jnp.eye(d) * masked_dynamics_noise,
-    }
-
-    masked_obs_noise_diag = jnp.ones(d) * masked_obs_noise
-
-    in_axes = (0, 0, 0, 0, na, na, na, na, na, na, na, 0, na, na)
-    v = jax.vmap(partial(kalman_sample, parallel=parallel_message_passing), in_axes)(
-        seed,
-        mu,
+    return _map_sessions(
+        _resample_location_one_session,
+        jr.split(seed, mask.shape[0]),
+        Y,
         mask,
-        zz,
-        m0,
-        S0,
-        A,
-        B,
-        Q,
-        C,
-        D,
-        R,
-        masked_dynamics_params,
-        masked_obs_noise_diag,
+        x,
+        h,
+        s,
+        mixed_map_iters=mixed_map_iters,
+        mixed_map_gpus=mixed_map_gpus,
+        Cd=Cd,
+        sigmasq=sigmasq,
+        sigmasq_loc=sigmasq_loc,
+        parallel=parallel_message_passing,
     )
-    return v
 
 
 def resample_model(
