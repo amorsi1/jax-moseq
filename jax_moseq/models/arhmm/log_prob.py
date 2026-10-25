@@ -3,7 +3,8 @@ import jax.numpy as jnp
 import numpy as np
 from functools import partial
 from jax_moseq.utils.autoregression import get_nlags, ar_log_likelihood
-from jax_moseq.utils import mixed_map
+from jax_moseq.utils import mixed_map, mixed_map_jit
+from jax_moseq.models.arhmm.gibbs import session_log_likelihoods
 from dynamax.hidden_markov_model.inference import hmm_filter
 from functools import partial
 
@@ -129,26 +130,37 @@ def state_cross_likelihoods(params, states, mask, **kwargs):
     given the dynamics of each other state. See page 33 of the
     supplement (Wiltchsko, 2015) for a formal definition.
     """
-    x, Ab, Q = jax.device_put((states["x"], params["Ab"], params["Q"]))
-    log_likelihoods = jax.lax.map(partial(ar_log_likelihood, x), (Ab, Q))
+    x, Ab, Q, z_all = jax.device_put(
+        (states["x"], params["Ab"], params["Q"], states["z"])
+    )
+    n_states = Ab.shape[0]
+    nlags = mask.shape[1] - z_all.shape[1]
+    valid = jnp.asarray(mask[:, nlags:] > 0)
 
-    nlags = mask.shape[1] - log_likelihoods.shape[2]
-    log_likelihoods = np.moveaxis(log_likelihoods, 0, 2)[mask[:, nlags:] > 0]
+    def summed_by_state(x_i, z_i, valid_i):
+        # (n_states, n_states): log likelihood under each state, summed over
+        # the valid frames assigned to each state
+        lls = session_log_likelihoods(x_i, Ab, Q)
+        onehot = jax.nn.one_hot(z_i, n_states, dtype=lls.dtype) * valid_i[:, None]
+        return onehot.T @ lls
 
-    z = states["z"][mask[:, nlags:] > 0]
+    sums = np.asarray(mixed_map(summed_by_state)(x, z_all, valid).sum(0))
+
+    z = np.asarray(states["z"])[np.asarray(valid)]
     changepoints = np.diff(z).nonzero()[0] + 1
     counts = np.bincount(z[changepoints])
 
-    n_states = log_likelihoods.shape[1]
     cross_likelihoods = np.zeros((n_states, n_states))
     for j in range(n_states):
-        ll = log_likelihoods[z == j].sum(0)
+        ll = sums[j]
         cross_likelihoods[j] = (ll - ll[j]) / (counts[j] + 1e-6)
     return cross_likelihoods
 
 
-@jax.jit
-def marginal_log_likelihood(mask, x, Ab, Q, pi, **kwargs):
+@mixed_map_jit
+def marginal_log_likelihood(
+    mask, x, Ab, Q, pi, *, mixed_map_iters, mixed_map_gpus, **kwargs
+):
     """Marginal log likelihood of continuous latents given model parameters.
 
     Parameters
@@ -173,10 +185,10 @@ def marginal_log_likelihood(mask, x, Ab, Q, pi, **kwargs):
     num_states = pi.shape[0]
 
     initial_distribution = jnp.ones(num_states) / num_states
-    log_likelihoods = jax.lax.map(partial(ar_log_likelihood, x), (Ab, Q))
-    log_likelihoods = jnp.moveaxis(log_likelihoods, 0, -1)
-    masked_log_likelihoods = log_likelihoods * mask[:, nlags:, None]
 
-    get_mll = lambda ll: hmm_filter(initial_distribution, pi, ll).marginal_loglik.sum()
-    mlls = mixed_map(get_mll)(masked_log_likelihoods)
+    def get_mll(x_i, mask_i):
+        lls = session_log_likelihoods(x_i, Ab, Q) * mask_i[nlags:, None]
+        return hmm_filter(initial_distribution, pi, lls).marginal_loglik.sum()
+
+    mlls = mixed_map(get_mll, iters=mixed_map_iters, gpus=mixed_map_gpus)(x, mask)
     return mlls.sum()

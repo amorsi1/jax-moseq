@@ -18,32 +18,34 @@ import jax.random as jr
 
 from functools import partial
 
-from jax_moseq.utils import device_put_as_scalar
-from jax_moseq.utils.autoregression import ar_log_likelihood, get_nlags
+from jax_moseq.utils import device_put_as_scalar, mixed_map, mixed_map_jit
+from jax_moseq.utils.autoregression import get_nlags
 from jax_moseq.utils.distributions import sample_hmm_stateseq
 from jax_moseq.utils.transitions import (
     init_hdp_transitions_by_group,
     resample_hdp_transitions_by_group,
 )
 
-from jax_moseq.models.arhmm.gibbs import resample_ar_params
+from jax_moseq.models.arhmm.gibbs import resample_ar_params, session_log_likelihoods
 from jax_moseq.models.arhmm.initialize import init_ar_params, init_hyperparams
 
 na = jnp.newaxis
 
 
-@jax.jit
-def resample_discrete_stateseqs(seed, x, mask, group, Ab, Q, pi, **kwargs):
+@mixed_map_jit
+def resample_discrete_stateseqs(
+    seed, x, mask, group, Ab, Q, pi, *, mixed_map_iters, mixed_map_gpus, **kwargs
+):
     """Resample ``z``, each session using its own group's transition matrix."""
     nlags = get_nlags(Ab)
-    log_likelihoods = jax.lax.map(partial(ar_log_likelihood, x), (Ab, Q))
-    _, z = jax.vmap(sample_hmm_stateseq, in_axes=(0, 0, 0, 0))(
-        jr.split(seed, mask.shape[0]),
-        pi[group],
-        jnp.moveaxis(log_likelihoods, 0, -1),
-        mask.astype(float)[:, nlags:],
+
+    def sample(seed_i, x_i, mask_i, pi_i):
+        lls = session_log_likelihoods(x_i, Ab, Q)
+        return sample_hmm_stateseq(seed_i, pi_i, lls, mask_i.astype(float)[nlags:])[1]
+
+    return mixed_map(sample, iters=mixed_map_iters, gpus=mixed_map_gpus)(
+        jr.split(seed, mask.shape[0]), x, mask, pi[group]
     )
-    return z
 
 
 def resample_model(

@@ -13,6 +13,7 @@ from jax_moseq.utils import (
     psd_inv,
     nan_check,
     mixed_map,
+    mixed_map_jit,
 )
 
 from jax_moseq.utils import convert_data_precision
@@ -28,8 +29,20 @@ from functools import partial
 na = jnp.newaxis
 
 
-@jax.jit
-def resample_discrete_stateseqs(seed, x, mask, Ab, Q, pi, **kwargs):
+def session_log_likelihoods(x: jnp.ndarray, Ab: jnp.ndarray, Q: jnp.ndarray) -> jnp.ndarray:
+    """AR log likelihood of one session under every state, (T - nlags, num_states).
+
+    States are processed serially so the (num_states, ...) intermediates of
+    ``ar_log_likelihood`` are never alive at once.
+    """
+    ll = jax.lax.map(partial(ar_log_likelihood, x), (Ab, Q))
+    return jnp.moveaxis(ll, 0, -1)
+
+
+@mixed_map_jit
+def resample_discrete_stateseqs(
+    seed, x, mask, Ab, Q, pi, *, mixed_map_iters, mixed_map_gpus, **kwargs
+):
     """
     Resamples the discrete state sequence ``z``.
 
@@ -56,18 +69,20 @@ def resample_discrete_stateseqs(seed, x, mask, Ab, Q, pi, **kwargs):
         Discrete state sequences.
     """
     nlags = get_nlags(Ab)
-    log_likelihoods = jax.lax.map(partial(ar_log_likelihood, x), (Ab, Q))
-    _, z = jax.vmap(sample_hmm_stateseq, in_axes=(0, na, 0, 0))(
-        jr.split(seed, mask.shape[0]),
-        pi,
-        jnp.moveaxis(log_likelihoods, 0, -1),
-        mask.astype(float)[:, nlags:],
+
+    def sample(seed_i, x_i, mask_i):
+        lls = session_log_likelihoods(x_i, Ab, Q)
+        return sample_hmm_stateseq(seed_i, pi, lls, mask_i.astype(float)[nlags:])[1]
+
+    return mixed_map(sample, iters=mixed_map_iters, gpus=mixed_map_gpus)(
+        jr.split(seed, mask.shape[0]), x, mask
     )
-    return z
 
 
-@jax.jit
-def stateseq_marginals(x, mask, Ab, Q, pi, **kwargs):
+@mixed_map_jit
+def stateseq_marginals(
+    x, mask, Ab, Q, pi, *, mixed_map_iters, mixed_map_gpus, **kwargs
+):
     """
     Computes the marginal probability of each discrete state at each time step.
 
@@ -95,17 +110,16 @@ def stateseq_marginals(x, mask, Ab, Q, pi, **kwargs):
     num_states = pi.shape[0]
 
     initial_distribution = jnp.ones(num_states) / num_states
-    log_likelihoods = jax.lax.map(partial(ar_log_likelihood, x), (Ab, Q))
-    log_likelihoods = jnp.moveaxis(log_likelihoods, 0, -1)
-    masked_log_likelihoods = log_likelihoods * mask[:, nlags:, na]
 
-    smoother = lambda lls: hmm_smoother(initial_distribution, pi, lls).smoothed_probs
-    z_marginals = mixed_map(smoother)(masked_log_likelihoods)
-    return z_marginals
+    def smooth(x_i, mask_i):
+        lls = session_log_likelihoods(x_i, Ab, Q) * mask_i[nlags:, na]
+        return hmm_smoother(initial_distribution, pi, lls).smoothed_probs
+
+    return mixed_map(smooth, iters=mixed_map_iters, gpus=mixed_map_gpus)(x, mask)
 
 
-@jax.jit
-def stateseq_mode(x, mask, Ab, Q, pi, **kwargs):
+@mixed_map_jit
+def stateseq_mode(x, mask, Ab, Q, pi, *, mixed_map_iters, mixed_map_gpus, **kwargs):
     """Most probable state sequence at each time step.
 
     The Viterbi counterpart of :py:func:`stateseq_marginals`: it returns the
@@ -138,14 +152,13 @@ def stateseq_mode(x, mask, Ab, Q, pi, **kwargs):
     num_states = pi.shape[0]
 
     initial_distribution = jnp.ones(num_states) / num_states
-    log_likelihoods = jax.lax.map(
-        partial(ar_log_likelihood, x), (Ab, Q)
-    )
-    log_likelihoods = jnp.moveaxis(log_likelihoods, 0, -1)
-    masked_log_likelihoods = log_likelihoods * mask[:, nlags:, na]
 
-    decode = lambda lls: hmm_posterior_mode(initial_distribution, pi, lls)
-    return convert_data_precision(mixed_map(decode)(masked_log_likelihoods))
+    def decode(x_i, mask_i):
+        lls = session_log_likelihoods(x_i, Ab, Q) * mask_i[nlags:, na]
+        return hmm_posterior_mode(initial_distribution, pi, lls)
+
+    z = mixed_map(decode, iters=mixed_map_iters, gpus=mixed_map_gpus)(x, mask)
+    return convert_data_precision(z)
 
 
 @nan_check
