@@ -14,6 +14,25 @@ from functools import partial
 na = jnp.newaxis
 
 
+def map_log_likelihoods(x, mask, Ab, Q, transform=lambda lls: lls):
+    """Masked log likelihoods of a chunk of segments, one segment at a time.
+
+    Meant for the chunk function of a ``batched``
+    :py:func:`jax_moseq.utils.mixed_map` over segments. A segment's
+    (T - nlags, num_states) log likelihoods are masked and passed through
+    ``transform`` before the next segment's are computed, so only one
+    segment's whitened residuals, and whatever ``transform`` returns, are held
+    for the whole chunk.
+    """
+    nlags = get_nlags(Ab)
+
+    def per_segment(args):
+        x, mask = args
+        return transform(ar_log_likelihoods(x, Ab, Q) * mask[nlags:, na])
+
+    return jax.lax.map(per_segment, (x, mask))
+
+
 def discrete_stateseq_log_prob(z, pi, **kwargs):
     """
     Calculate the log probability of a discrete state sequence
