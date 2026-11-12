@@ -360,3 +360,17 @@ def test_batched_under_mixed_map_jit(restore_mixed_map_globals):
         set_mixed_map_iters(k)
         np.testing.assert_array_equal(run(x), x + 1.0)
 
+
+def test_mixed_map_jit_lower_follows_globals_and_cache_clears(restore_mixed_map_globals):
+    x = jnp.arange(26.0).reshape(13, 2)
+
+    @mixed_map_jit
+    def run(x, mixed_map_iters, mixed_map_gpus):
+        return mixed_map(lambda r: r * 2.0, iters=mixed_map_iters, gpus=mixed_map_gpus)(x)
+
+    set_mixed_map_iters(1)
+    text_one = run.lower(x).as_text()
+    set_mixed_map_iters(4)
+    assert run.lower(x).as_text() != text_one
+    run(x)
+    run.clear_cache()
