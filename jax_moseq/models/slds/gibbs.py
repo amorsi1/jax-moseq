@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import tensorflow_probability.substrates.jax.distributions as tfd
 from functools import partial
-from jax_moseq.utils import mixed_map, apply_affine
+from jax_moseq.utils import mixed_map, mixed_map_jit, apply_affine
 from jax_moseq.utils.precision import full_float32_matmuls
 from jax_moseq.models import arhmm
 from jax_moseq.utils.kalman import (
@@ -67,7 +67,75 @@ def resample_continuous_stateseqs(
     x : jax.Array of shape (n_recordings, n_timesteps, latent_dim)
         Posterior sample of latent trajectories.
     """
-    n_recordings, latent_dim, obs_dim = y.shape[0], Ab.shape[1], y.shape[-1]
+    return _resample_continuous_stateseqs(
+        seed,
+        y,
+        mask,
+        z,
+        s,
+        Ab,
+        Q,
+        Cd,
+        sigmasq,
+        jitter,
+        parallel_message_passing,
+    )
+
+
+@mixed_map_jit(static_argnames=("parallel_message_passing",))
+def _resample_continuous_stateseqs(
+    seed,
+    y,
+    mask,
+    z,
+    s,
+    Ab,
+    Q,
+    Cd,
+    sigmasq,
+    jitter,
+    parallel_message_passing,
+    mixed_map_iters=None,
+    mixed_map_gpus=None,
+):
+    return sample_continuous_stateseqs_per_session(
+        seed,
+        mask,
+        z,
+        (y, s),
+        lambda y, s: (y, s, Cd, sigmasq),
+        Ab,
+        Q,
+        y.shape[-1],
+        jitter,
+        parallel_message_passing,
+        mixed_map_iters,
+        mixed_map_gpus,
+    )
+
+
+def sample_continuous_stateseqs_per_session(
+    seed,
+    mask,
+    z,
+    session_args,
+    to_obs,
+    Ab,
+    Q,
+    obs_dim,
+    jitter,
+    parallel,
+    iters,
+    gpus,
+):
+    """Sample `x` with every per-session step inside one `mixed_map`.
+
+    `to_obs(*args)` maps one session's slice of the arrays in `session_args`
+    to `(y, s, Cd, sigmasq)`, so that anything derived from the full-N inputs
+    (e.g. the keypoint alignment) is only ever formed for the sessions in the
+    current chunk. Returns `x` of shape (n_recordings, n_timesteps, latent_dim).
+    """
+    n_recordings, latent_dim = mask.shape[0], Ab.shape[1]
     n_lags = Ab.shape[2] // latent_dim
 
     # TODO Parameterize these distributional hyperparameter
@@ -76,36 +144,16 @@ def resample_continuous_stateseqs(
     masked_dynamics_noise = 10
     masked_obs_noise = 10
 
-    # =====================================================================
-    # 1. Omit the first n_lags frames of observations and associated sequences
-    # =====================================================================
-    y_ = y[:, n_lags - 1 :]
-    mask_ = mask[:, n_lags - 1 :]
-
-    # Scale unscaled observations by fitted diagonal scales
-    R_ = sigmasq * s[:, n_lags - 1 :]
-
-    # ==========================================================================
-    # 2. Reformat n_lags'th-order AR dynamics in R^D to 1st-order dynamics in R^{DL}
-    # ==========================================================================
-    C_, d_, R_, y_, m0_, S0_ = jax.vmap(
-        ar_to_lds_emissions, in_axes=(na, 0, 0, na, na, na)
-    )(Cd, sigmasq * s, y, m0, S0, n_lags)
-
+    # Reformat n_lags'th-order AR dynamics in R^D to 1st-order dynamics in R^{DL}
     A_, b_, Q_ = ar_to_lds_dynamics(Ab, Q)
-
-    # =============================================
-    # 3. Formulate parameters for masked timesteps
-    # =============================================
-    ar_dim = latent_dim * n_lags
 
     # If masked, hold the last state, i.e. set dynamics for "unlagged" states to
     # identity matrix and all other state dynamics to 0
+    ar_dim = latent_dim * n_lags
     eye_zero_order = jnp.zeros((ar_dim, ar_dim))
     eye_zero_order = eye_zero_order.at[-latent_dim:, -latent_dim:].set(
         jnp.eye(latent_dim)
     )
-
     masked_dynamics_params = {
         "weights": eye_zero_order,
         "bias": jnp.zeros(ar_dim),
@@ -113,36 +161,41 @@ def resample_continuous_stateseqs(
     }
     masked_obs_noise_diag = jnp.ones(obs_dim) * masked_obs_noise
 
-    # ==================================================
-    # 4. Apply vectorized Kalman sample to each recording
-    # Shapes of time-varying parameters going into the Kalman sampler are
-    #   ys:     (n_timesteps-n_lags+1, obs_dim), corresponding to timesteps  [nlags-1, T)
-    #   mask:   (n_timesteps-n_lags+1,)
-    #   zs:     (n_timesteps-n_lags,), corresponding to timesteps [n_lags, T)
-    #   Rs:     (n_timesteps-n_lags+1, obs_dim)
-    # ==================================================
-    x = batched_kalman_sample(
-        jr.split(seed, n_recordings),
-        y_,
-        mask_,
-        z,
-        m0,
-        S0,
-        A_,
-        b_,
-        Q_,
-        C_,
-        d_,
-        R_,
-        masked_dynamics_params,
-        masked_obs_noise_diag,
-        jitter,
-        parallel_message_passing,
+    # Shapes going into the Kalman sampler, per recording:
+    #   ys: (n_timesteps-n_lags+1, obs_dim), corresponding to timesteps [nlags-1, T)
+    #   mask: (n_timesteps-n_lags+1,)
+    #   zs: (n_timesteps-n_lags,), corresponding to timesteps [n_lags, T)
+    #   Rs: (n_timesteps-n_lags+1, obs_dim)
+    def sample_one(seed, mask, z, *args):
+        y, s, Cd, sigmasq = to_obs(*args)
+        # the (m0_, S0_) returned here are not used, as upstream
+        C_, d_, R_, y_, _, _ = ar_to_lds_emissions(
+            Cd, sigmasq * s, y, m0, S0, n_lags
+        )
+        return kalman_sample(
+            seed,
+            y_,
+            mask[n_lags - 1 :],
+            z,
+            m0,
+            S0,
+            A_,
+            b_,
+            Q_,
+            C_,
+            d_,
+            R_,
+            masked_dynamics_params,
+            masked_obs_noise_diag,
+            jitter=jitter,
+            parallel=parallel,
+        )
+
+    x = mixed_map(sample_one, iters=iters, gpus=gpus)(
+        jr.split(seed, n_recordings), mask, z, *session_args
     )
 
-    # =========================================================================
-    # 5. Reformat sampled trajectories back into L'th order AR dynamics in R^D
-    # =========================================================================
+    # Reformat sampled trajectories back into L'th order AR dynamics in R^D
     if n_lags > 1:
         x = jnp.concatenate(
             [
@@ -154,7 +207,6 @@ def resample_continuous_stateseqs(
             axis=1,
         )
     return x
-
 
 
 @partial(jax.jit, static_argnames=("parallel",))
@@ -200,8 +252,20 @@ def batched_kalman_sample(
     return x
 
 
-@jax.jit
-def resample_obs_variance(seed, Y, mask, x, s, Cd, nu_sigma, sigmasq_0, **kwargs):
+@mixed_map_jit
+def resample_obs_variance(
+    seed,
+    Y,
+    mask,
+    x,
+    s,
+    Cd,
+    nu_sigma,
+    sigmasq_0,
+    mixed_map_iters=None,
+    mixed_map_gpus=None,
+    **kwargs
+):
     """
     Resample the observation variance `sigmasq`.
 
@@ -231,8 +295,36 @@ def resample_obs_variance(seed, Y, mask, x, s, Cd, nu_sigma, sigmasq_0, **kwargs
     sigmasq : jax_array of shape obs_dim
         Unscaled noise.
     """
-    sqerr = compute_squared_error(Y, x, Cd, mask)
-    return resample_obs_variance_from_sqerr(seed, sqerr, mask, s, nu_sigma, sigmasq_0)
+    S_y = sum_weighted_sqerr(
+        lambda Y, x, mask: compute_squared_error(Y, x, Cd, mask),
+        (Y, x, mask),
+        s,
+        mixed_map_iters,
+        mixed_map_gpus,
+    )
+    return resample_obs_variance_from_sums(seed, S_y, mask, nu_sigma, sigmasq_0)
+
+
+def sum_weighted_sqerr(sqerr_fn, session_args, s, iters, gpus):
+    """Sum of `sqerr / s` over sessions and time, computed per session.
+
+    `sqerr_fn(*args)` maps one session's slice of the arrays in `session_args`
+    to its squared error (T, k); `s` has shape (N, T, k). Returns shape k.
+    """
+    k = s.shape[-1]
+    per_session = mixed_map(
+        lambda s, *args: (sqerr_fn(*args) / s).reshape(-1, k).sum(0),
+        iters=iters,
+        gpus=gpus,
+    )
+    return per_session(s, *session_args).sum(0)
+
+
+@jax.jit
+def resample_obs_variance_from_sums(seed, S_y, mask, nu_sigma, sigmasq_0):
+    degs = nu_sigma + 3 * mask.sum()
+    variance = nu_sigma * sigmasq_0 + S_y
+    return _resample_spread(seed, degs, variance)
 
 
 @jax.jit
@@ -265,12 +357,9 @@ def resample_obs_variance_from_sqerr(
     sigmasq : jax_array of shape obs_dim
         Unscaled noise.
     """
-    degs = nu_sigma + 3 * mask.sum()
-
     k = sqerr.shape[-1]
     S_y = (sqerr / s).reshape(-1, k).sum(0)  # (..., k) -> k
-    variance = nu_sigma * sigmasq_0 + S_y
-    return _resample_spread(seed, degs, variance)
+    return resample_obs_variance_from_sums(seed, S_y, mask, nu_sigma, sigmasq_0)
 
 
 @jax.jit
