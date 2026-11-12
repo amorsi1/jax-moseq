@@ -418,6 +418,7 @@ def mixed_map(
     out_axes=None,
     iters: Optional[int] = None,
     gpus: Optional[int] = None,
+    batched: bool = False,
 ):
     """
     Memory-efficient drop-in replacement for `jax.vmap(fun, in_axes, out_axes)`.
@@ -438,6 +439,14 @@ def mixed_map(
         :py:func:`jax_moseq.utils.get_mixed_map_gpus`, read at call time.
         If rounding a chunk up to a multiple of `gpus` would exceed N, a
         single N-row step is used when `gpus` divides N, otherwise `gpus=1`.
+    batched: bool, default=False
+        If True, `fun` is not vmapped but called on a whole chunk of rows
+        (mapped axes of size `step`, which the last chunk may share with the
+        previous one) and must return arrays with the rows on axis 0. Use it
+        when a step has to process the rows of a chunk differently from
+        `jax.vmap`, e.g. serially with `jax.lax.map` to keep a large
+        per-row temporary from being held for the whole chunk at once.
+        `out_axes` must be 0.
 
     Inputs are sliced inside the loop and outputs are written into buffers
     allocated once, so no padded or reshaped copies of the full arrays are
@@ -494,7 +503,7 @@ def mixed_map(
 
         # output structure/axes are only known after tracing `fun`
         out_struct = jax.eval_shape(
-            jax.vmap(call, in_axes=mapped_axes),
+            call if batched else jax.vmap(call, in_axes=mapped_axes),
             *[
                 jax.ShapeDtypeStruct(
                     args[i].shape[:ax] + (1,) + args[i].shape[ax + 1 :], args[i].dtype
@@ -509,7 +518,12 @@ def mixed_map(
         else:
             out_axes_tree = type(out_struct)(out_axes_tree)
 
-        vmapped = jax.vmap(call, in_axes=mapped_axes, out_axes=out_axes_tree)
+        if batched:
+            if any(ax != 0 for ax in jax.tree_util.tree_leaves(out_axes_tree)):
+                raise ValueError("`out_axes` must be 0 when `batched=True`")
+            vmapped = call
+        else:
+            vmapped = jax.vmap(call, in_axes=mapped_axes, out_axes=out_axes_tree)
         # With one device plain vmap is used: pmap over one device adds nothing,
         # and its outputs carry a sharding over pmap's own mesh, so every jitted
         # step that later receives them misses its cache and recompiles.
