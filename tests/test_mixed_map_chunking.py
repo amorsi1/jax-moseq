@@ -308,3 +308,55 @@ def test_mixed_map_jit_with_static_argnames(restore_mixed_map_globals):
 
     set_mixed_map_iters(3)
     np.testing.assert_array_equal(run(x, scale=3.0), x * 3.0)
+
+
+def _serial_then_vectorized(xc, w, seen=None):
+    """Chunk function: serial per-row temporaries, then a vectorized reduction."""
+    if seen is not None:
+        seen.append(xc.shape[0])
+    rows = jax.lax.map(lambda r: r * w, xc)
+    return (rows**2).sum(-1), rows
+
+
+@pytest.mark.parametrize("n", [1, 7, 13])
+@pytest.mark.parametrize("iters", [1, 2, 3, 20])
+def test_batched_matches_vmap_and_chunks_rows(n, iters):
+    x = jnp.arange(n * 4, dtype=float).reshape(n, 4) / 7
+    w = jnp.arange(4.0)
+    seen = []
+    out = mixed_map(
+        lambda xc, w: _serial_then_vectorized(xc, w, seen),
+        (0, None),
+        iters=iters,
+        gpus=1,
+        batched=True,
+    )(x, w)
+    expected = jax.vmap(lambda r: _serial_then_vectorized(r[None], w))(x)
+    np.testing.assert_allclose(out[0], expected[0][:, 0])
+    np.testing.assert_allclose(out[1], expected[1][:, 0])
+    # one chunk of ceil(n / iters) rows (plus the size-1 probe used for shapes)
+    assert max(seen) == -(-n // iters) or max(seen) == 1
+
+
+def test_batched_rejects_non_zero_out_axes():
+    x = jnp.ones((6, 3))
+    with pytest.raises(ValueError):
+        mixed_map(lambda xc: (xc, xc), out_axes=(1, 0), iters=2, gpus=1, batched=True)(x)
+
+
+def test_batched_under_mixed_map_jit(restore_mixed_map_globals):
+    x = jnp.arange(26.0).reshape(13, 2)
+
+    @mixed_map_jit
+    def run(x, mixed_map_iters, mixed_map_gpus):
+        return mixed_map(
+            lambda xc: jax.lax.map(lambda r: r + 1.0, xc),
+            iters=mixed_map_iters,
+            gpus=mixed_map_gpus,
+            batched=True,
+        )(x)
+
+    for k in [1, 4, 13]:
+        set_mixed_map_iters(k)
+        np.testing.assert_array_equal(run(x), x + 1.0)
+
