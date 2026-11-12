@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import jax.random as jr
 from functools import partial
 
+from jax_moseq.utils import mixed_map, mixed_map_jit
 from jax_moseq.utils.kalman import kalman_sample
 from jax_moseq.utils.precision import full_float32_matmuls
 from jax_moseq.utils.distributions import sample_vonmises, sample_vonmises_fisher
@@ -82,29 +83,57 @@ def resample_continuous_stateseqs(
     )
 
 
-@partial(jax.jit, static_argnames=("parallel_message_passing",))
+@mixed_map_jit(static_argnames=("parallel_message_passing",))
 def _resample_continuous_stateseqs(
-    seed, Y, mask, v, h, s, z, Cd, sigmasq, Ab, Q, jitter, parallel_message_passing
+    seed,
+    Y,
+    mask,
+    v,
+    h,
+    s,
+    z,
+    Cd,
+    sigmasq,
+    Ab,
+    Q,
+    jitter,
+    parallel_message_passing,
+    mixed_map_iters=None,
+    mixed_map_gpus=None,
 ):
-    Y, s, Cd, sigmasq = to_vanilla_slds(Y, v, h, s, Cd, sigmasq)
-    x = slds.resample_continuous_stateseqs(
+    k, d = Y.shape[-2:]
+    return slds.sample_continuous_stateseqs_per_session(
         seed,
-        Y,
         mask,
         z,
-        s,
+        (Y, v, h, s),
+        lambda Y, v, h, s: to_vanilla_slds(Y, v, h, s, Cd, sigmasq),
         Ab,
         Q,
-        Cd,
-        sigmasq,
-        jitter=jitter,
-        parallel_message_passing=parallel_message_passing,
+        k * d,
+        jitter,
+        parallel_message_passing,
+        mixed_map_iters,
+        mixed_map_gpus,
     )
-    return x
 
 
-@jax.jit
-def resample_obs_variance(seed, Y, mask, Cd, x, v, h, s, nu_sigma, sigmasq_0, **kwargs):
+@mixed_map_jit
+def resample_obs_variance(
+    seed,
+    Y,
+    mask,
+    Cd,
+    x,
+    v,
+    h,
+    s,
+    nu_sigma,
+    sigmasq_0,
+    mixed_map_iters=None,
+    mixed_map_gpus=None,
+    **kwargs
+):
     """
     Resample the observation variance ``sigmasq``.
 
@@ -138,14 +167,31 @@ def resample_obs_variance(seed, Y, mask, Cd, x, v, h, s, nu_sigma, sigmasq_0, **
     sigmasq : jax_array of shape k
         Unscaled noise.
     """
-    sqerr = compute_squared_error(Y, x, v, h, Cd, mask)
-    return slds.resample_obs_variance_from_sqerr(
-        seed, sqerr, mask, s, nu_sigma, sigmasq_0
+    S_y = slds.sum_weighted_sqerr(
+        lambda Y, x, v, h, mask: compute_squared_error(Y, x, v, h, Cd, mask),
+        (Y, x, v, h, mask),
+        s,
+        mixed_map_iters,
+        mixed_map_gpus,
     )
+    return slds.resample_obs_variance_from_sums(seed, S_y, mask, nu_sigma, sigmasq_0)
 
 
-@jax.jit
-def resample_scales(seed, Y, x, v, h, Cd, sigmasq, nu_s, s_0, **kwargs):
+@mixed_map_jit
+def resample_scales(
+    seed,
+    Y,
+    x,
+    v,
+    h,
+    Cd,
+    sigmasq,
+    nu_s,
+    s_0,
+    mixed_map_iters=None,
+    mixed_map_gpus=None,
+    **kwargs
+):
     """
     Resample the scale values ``s``.
 
@@ -177,8 +223,24 @@ def resample_scales(seed, Y, x, v, h, Cd, sigmasq, nu_s, s_0, **kwargs):
     s : jax array of shape (N, T, k)
         Noise scales.
     """
-    sqerr = compute_squared_error(Y, x, v, h, Cd)
-    return slds.resample_scales_from_sqerr(seed, sqerr, sigmasq, nu_s, s_0)
+    N = Y.shape[0]
+    # s_0 is mapped over sessions only if it has a session axis
+    has_session_axis = jnp.ndim(s_0) == Y.ndim - 1
+    map_s_0 = has_session_axis and jnp.shape(s_0)[0] == N
+    if has_session_axis and not map_s_0:  # leading axis of size 1
+        s_0 = s_0[0]
+
+    def resample_session(seed, Y, x, v, h, *s_0_session):
+        sqerr = compute_squared_error(Y, x, v, h, Cd)
+        return slds.resample_scales_from_sqerr(
+            seed, sqerr, sigmasq, nu_s, s_0_session[0] if map_s_0 else s_0
+        )
+
+    # Per-session seeds: the draw differs from a single full-array draw but is
+    # statistically equivalent and does not depend on the chunk size.
+    return mixed_map(resample_session, iters=mixed_map_iters, gpus=mixed_map_gpus)(
+        jr.split(seed, N), Y, x, v, h, *((s_0,) if map_s_0 else ())
+    )
 
 
 @jax.jit
@@ -215,8 +277,19 @@ def compute_squared_error(Y, x, v, h, Cd, mask=None):
     return sqerr
 
 
-@jax.jit
-def resample_heading(seed, Y, x, v, s, Cd, sigmasq, **kwargs):
+@mixed_map_jit
+def resample_heading(
+    seed,
+    Y,
+    x,
+    v,
+    s,
+    Cd,
+    sigmasq,
+    mixed_map_iters=None,
+    mixed_map_gpus=None,
+    **kwargs
+):
     """
     Resample the heading angles ``h``.
 
@@ -246,17 +319,22 @@ def resample_heading(seed, Y, x, v, s, Cd, sigmasq, **kwargs):
     """
     k = Y.shape[-2]
 
-    Y_bar = estimate_aligned(x, Cd, k)
-    Y_cent = Y - v[..., na, :]
-    variance = s * sigmasq
+    def mean_direction(Y, x, v, s):
+        Y_bar = estimate_aligned(x, Cd, k)
+        Y_cent = Y - v[..., na, :]
+        variance = s * sigmasq
 
-    # [(..., t, k, d, na) * (..., t, k, na, d) / (..., t, k, na, na)] -> (..., t, d, d)
-    S = (Y_bar[..., :2, na] * Y_cent[..., na, :2] / variance[..., na, na]).sum(-3)
-    del Y_bar, Y_cent, variance  # free up memory
+        # [(t, k, d, na) * (t, k, na, d) / (t, k, na, na)] -> (t, d, d)
+        S = (Y_bar[..., :2, na] * Y_cent[..., na, :2] / variance[..., na, na]).sum(-3)
+        return jnp.stack([S[..., 0, 0] + S[..., 1, 1], S[..., 0, 1] - S[..., 1, 0]], -1)
 
-    kappa_cos = S[..., 0, 0] + S[..., 1, 1]
-    kappa_sin = S[..., 0, 1] - S[..., 1, 0]
-    del S
+    kappa_cos, kappa_sin = jnp.moveaxis(
+        mixed_map(mean_direction, iters=mixed_map_iters, gpus=mixed_map_gpus)(
+            Y, x, v, s
+        ),
+        -1,
+        0,
+    )
 
     # The angle of a von Mises-Fisher draw on the circle is von Mises
     # distributed, with the mean direction's angle and length.
@@ -266,7 +344,7 @@ def resample_heading(seed, Y, x, v, s, Cd, sigmasq, **kwargs):
     return h
 
 
-@partial(jax.jit, static_argnames=("parallel_message_passing",))
+@mixed_map_jit(static_argnames=("parallel_message_passing",))
 def resample_location(
     seed,
     Y,
@@ -278,6 +356,8 @@ def resample_location(
     sigmasq,
     sigmasq_loc,
     parallel_message_passing=True,
+    mixed_map_iters=None,
+    mixed_map_gpus=None,
     **kwargs
 ):
     """
@@ -317,16 +397,7 @@ def resample_location(
     """
     k, d = Y.shape[-2:]
 
-    Y_rot = apply_rotation(estimate_aligned(x, Cd, k), h)
-
-    variance = s * sigmasq
-    gammasq = 1 / (1 / variance).sum(-1, keepdims=True)
-
-    mu = jnp.einsum("...tkd, ...tk->...td", Y - Y_rot, gammasq / variance)
-
-    # Apply Kalman filter to get smooth headings
     # TODO Parameterize these distributional hyperparameter
-    seed = jr.split(seed, mask.shape[0])
     m0 = jnp.zeros(d)
     S0 = jnp.eye(d) * 1e4
     A = jnp.eye(d)[na]
@@ -334,8 +405,6 @@ def resample_location(
     Q = jnp.eye(d)[na] * sigmasq_loc
     C = jnp.eye(d)
     D = jnp.zeros(d)
-    R = gammasq[..., na] * jnp.eye(d, dtype=gammasq.dtype)
-    zz = jnp.zeros_like(mask[:, 1:], dtype=int)
 
     masked_dynamics_noise = sigmasq_loc * 10
     masked_obs_noise = sigmasq.max() * 10
@@ -348,24 +417,38 @@ def resample_location(
 
     masked_obs_noise_cov = jnp.eye(d, dtype=sigmasq.dtype) * masked_obs_noise
 
-    in_axes = (0, 0, 0, 0, na, na, na, na, na, na, na, 0, na, na)
-    v = jax.vmap(partial(kalman_sample, parallel=parallel_message_passing), in_axes)(
-        seed,
-        mu,
-        mask,
-        zz,
-        m0,
-        S0,
-        A,
-        B,
-        Q,
-        C,
-        D,
-        R,
-        masked_dynamics_params,
-        masked_obs_noise_cov,
+    def sample_session(seed, Y, mask, x, h, s):
+        Y_rot = apply_rotation(estimate_aligned(x, Cd, k), h)
+
+        variance = s * sigmasq
+        gammasq = 1 / (1 / variance).sum(-1, keepdims=True)
+
+        mu = jnp.einsum("...tkd, ...tk->...td", Y - Y_rot, gammasq / variance)
+
+        # Apply Kalman filter to get smooth headings
+        R = gammasq[..., na] * jnp.eye(d, dtype=gammasq.dtype)
+        zz = jnp.zeros_like(mask[1:], dtype=int)
+        return kalman_sample(
+            seed,
+            mu,
+            mask,
+            zz,
+            m0,
+            S0,
+            A,
+            B,
+            Q,
+            C,
+            D,
+            R,
+            masked_dynamics_params,
+            masked_obs_noise_cov,
+            parallel=parallel_message_passing,
+        )
+
+    return mixed_map(sample_session, iters=mixed_map_iters, gpus=mixed_map_gpus)(
+        jr.split(seed, mask.shape[0]), Y, mask, x, h, s
     )
-    return v
 
 
 @full_float32_matmuls
