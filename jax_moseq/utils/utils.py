@@ -587,6 +587,16 @@ def mixed_map_jit(fun=None, *, static_argnames=()):
                 **kwargs,
             )
 
+        def lower(*args, **kwargs):
+            return jitted.lower(
+                *args,
+                mixed_map_iters=get_mixed_map_iters(),
+                mixed_map_gpus=get_mixed_map_gpus(),
+                **kwargs,
+            )
+
+        wrapper.lower = lower
+        wrapper.clear_cache = jitted.clear_cache
         return wrapper
 
     return decorator if fun is None else decorator(fun)
