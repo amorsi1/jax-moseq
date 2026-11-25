@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
-from functools import partial
+from jax_moseq.utils import mixed_map, mixed_map_jit
 from jax_moseq.utils.autoregression import (
     get_nlags,
     ar_log_likelihood,
@@ -12,6 +12,25 @@ from jax_moseq.utils.distributions import hmm_marginal_log_likelihood
 from functools import partial
 
 na = jnp.newaxis
+
+
+def map_log_likelihoods(x, mask, Ab, Q, transform=lambda lls: lls):
+    """Masked log likelihoods of a chunk of segments, one segment at a time.
+
+    Meant for the chunk function of a ``batched``
+    :py:func:`jax_moseq.utils.mixed_map` over segments. A segment's
+    (T - nlags, num_states) log likelihoods are masked and passed through
+    ``transform`` before the next segment's are computed, so only one
+    segment's whitened residuals, and whatever ``transform`` returns, are held
+    for the whole chunk.
+    """
+    nlags = get_nlags(Ab)
+
+    def per_segment(args):
+        x, mask = args
+        return transform(ar_log_likelihoods(x, Ab, Q) * mask[nlags:, na])
+
+    return jax.lax.map(per_segment, (x, mask))
 
 
 def discrete_stateseq_log_prob(z, pi, **kwargs):
@@ -129,28 +148,40 @@ def model_likelihood(data, states, params, hypparams=None, **kwargs):
     return log_joint_likelihood(**data, **states, **params)
 
 
+@mixed_map_jit
+def _cross_terms(x, z, valid, Ab, Q, *, mixed_map_iters=None, mixed_map_gpus=None):
+    """Per-segment sum of the log likelihoods of each state's frames under
+    every state, shape (N, num_states, num_states)."""
+
+    def cross_term(x, z, valid):
+        lls = jnp.where(valid[:, na], ar_log_likelihoods(x, Ab, Q), 0)
+        labels = jax.nn.one_hot(z, Ab.shape[0], dtype=lls.dtype)
+        return jnp.matmul(labels.T, lls, precision=jax.lax.Precision.HIGHEST)
+
+    # one segment at a time within a chunk, as for the other log likelihoods
+    chunk_terms = lambda *chunk: jax.lax.map(lambda a: cross_term(*a), chunk)
+    mixed = mixed_map(chunk_terms, iters=mixed_map_iters, gpus=mixed_map_gpus, batched=True)
+    return mixed(x, z, valid)
+
+
 def state_cross_likelihoods(params, states, mask, **kwargs):
     """
     Calculate log likelihoods of frames assigned to each state,
     given the dynamics of each other state. See page 33 of the
     supplement (Wiltchsko, 2015) for a formal definition.
     """
-    x, Ab, Q = jax.device_put((states["x"], params["Ab"], params["Q"]))
-    log_likelihoods = jax.lax.map(partial(ar_log_likelihood, x), (Ab, Q))
+    x, z, Ab, Q = jax.device_put((states["x"], states["z"], params["Ab"], params["Q"]))
+    nlags = get_nlags(Ab)
+    valid = np.asarray(mask[:, nlags:] > 0)
+    summed = np.asarray(_cross_terms(x, z, valid, Ab, Q)).sum(0)
 
-    nlags = mask.shape[1] - log_likelihoods.shape[2]
-    log_likelihoods = np.moveaxis(log_likelihoods, 0, 2)[mask[:, nlags:] > 0]
-
-    z = states["z"][mask[:, nlags:] > 0]
+    z = np.asarray(states["z"])[valid]
     changepoints = np.diff(z).nonzero()[0] + 1
     counts = np.bincount(z[changepoints])
 
-    n_states = log_likelihoods.shape[1]
-    cross_likelihoods = np.zeros((n_states, n_states))
-    for j in range(n_states):
-        ll = log_likelihoods[z == j].sum(0)
-        cross_likelihoods[j] = (ll - ll[j]) / (counts[j] + 1e-6)
-    return cross_likelihoods
+    # row j holds the log likelihoods of state j's frames under every state
+    own = np.diag(summed)[:, None]
+    return (summed - own) / (counts[:, None] + 1e-6)
 
 
 @jax.jit
